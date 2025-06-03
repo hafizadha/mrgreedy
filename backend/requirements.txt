@@ -10,3 +10,6 @@ python-multipart
 pandas
 supabase
 langchain-community
+markitdown[pdf]
+firecrawl-py
+google-genai

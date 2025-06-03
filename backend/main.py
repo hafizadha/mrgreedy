@@ -18,9 +18,11 @@ from supabase import create_client, Client
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import shutil
 import pandas as pd
-from google import genai
+from google import genai as gi
 from markitdown import MarkItDown
 import requests
+from firecrawl import FirecrawlApp, JsonConfig
+
 
 
 
@@ -89,13 +91,27 @@ if not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+
+def portfolio_scraper(portfolio_str):
+    portfolio_str = "https://coedd-territory.vercel.app/"
+
+    FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
+    app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
+
+    response = app.extract([
+    portfolio_str
+    ], prompt='Extract the applicants name and email, their projects, experiences and top skills. For projects and experiences, include their name and description. Then for skills in project and experience, include into top skills')
+    print(response)
+
+    print(json.dumps(response.data, indent=4))
+
+    # JANGAN LUPA FORMATTING
+
+
 def ai_detection():
+    gemini_client =  gi.Client(api_key="EnterAPI")
 
-    gemini_client = genai.Client(api_key="EnterAPI")
-
-    results = (
-    supabase.table("job_applications").select("*").eq("is_analyzed", False).execute()
-)
+    results = supabase.table("job_applications").select("*").eq("is_analyzed", False).execute()
 
     rows = results.data
 
