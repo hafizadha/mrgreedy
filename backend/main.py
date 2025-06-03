@@ -29,7 +29,7 @@ api_key = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
 
 # Use the Gemini Pro model (text-only)
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
 app = FastAPI()
 
@@ -161,6 +161,7 @@ async def send_job_application(selected_job: str = Form(...), file: UploadFile =
 
     try:
         # Read the uploaded PDF into a BytesIO buffer
+        '''
         table_ref = db.reference('job_applications')
         raw = table_ref.get()
         if isinstance(raw, dict):
@@ -177,6 +178,20 @@ async def send_job_application(selected_job: str = Form(...), file: UploadFile =
         except:
             max_number = -1
         new_resume_id = max_number + 1
+        '''
+
+        
+        table_ref = supabase.table("job_applications")
+        response = table_ref.select("*").execute()
+        df_temp = pd.DataFrame(response.data)
+
+        try:
+            max_number = int(df_temp["ResumeID"].max())
+        except:
+            max_number = -1
+        new_resume_id = max_number + 1
+
+
 
         file_content = await file.read()
         pdf_stream = BytesIO(file_content)
@@ -327,6 +342,3 @@ def download_pdf(pdf_filename: str = Query(..., description="The name of the PDF
     
 
     
-
-
-
