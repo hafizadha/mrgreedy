@@ -20,6 +20,7 @@ import shutil
 import pandas as pd
 from google import genai
 from markitdown import MarkItDown
+import requests
 
 
 
@@ -89,6 +90,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def ai_detection():
+
+    gemini_client = genai.Client(api_key="EnterAPI")
+
     results = (
     supabase.table("job_applications").select("*").eq("is_analyzed", False).execute()
 )
@@ -106,13 +110,13 @@ def ai_detection():
             f.write(signed_url_data)
         
 
-        md = MarkItDown(llm_client=client, llm_model="gemini-2.0-flash")
+        md = MarkItDown(llm_client=gemini_client, llm_model="gemini-2.5-flash-preview-05-20")
         result = md.convert(pdf_name)
 
         response = requests.post(
         "https://api.sapling.ai/api/v1/aidetect",
         json={
-            "key": "X6ZAOA3FX1SY1RUR6BMC9JT5T6CCLYQ8",
+            "key": "ENTER API KEY",
             "text": result.text_content
         })
 
