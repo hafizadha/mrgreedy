@@ -1,0 +1,12 @@
+pdfminer.six
+google-generativeai
+python-dotenv
+langchain
+numpy
+firebase-admin
+fastapi
+uvicorn
+python-multipart
+pandas
+supabase
+langchain-community

@@ -1,0 +1,8 @@
+backend/venv/
+jobportal/node_modules/
+__pycache__/
+*.pyc
+.env
+
+backend/api_keys.env
+backend/Credentials.json
