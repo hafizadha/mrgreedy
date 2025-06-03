@@ -18,6 +18,10 @@ from supabase import create_client, Client
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import shutil
 import pandas as pd
+from google import genai
+from markitdown import MarkItDown
+
+
 
 
 # Load embedding model
@@ -82,6 +86,55 @@ if not SUPABASE_KEY:
     raise ValueError("SUPABASE_API_KEY not found in api_keys.env")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def ai_detection():
+    results = (
+    supabase.table("job_applications").select("*").eq("is_analyzed", False).execute()
+)
+
+    rows = results.data
+
+    for row in rows:
+
+        pdf_name = str(row["ResumeID"])+ ".pdf"
+        print(pdf_name)
+
+        signed_url_data = supabase.storage.from_("pdf-files").download(pdf_name)
+
+        with open(pdf_name, "wb") as f:
+            f.write(signed_url_data)
+        
+
+        md = MarkItDown(llm_client=client, llm_model="gemini-2.0-flash")
+        result = md.convert(pdf_name)
+
+        response = requests.post(
+        "https://api.sapling.ai/api/v1/aidetect",
+        json={
+            "key": "X6ZAOA3FX1SY1RUR6BMC9JT5T6CCLYQ8",
+            "text": result.text_content
+        })
+
+        decoded = response.content.decode('utf-8')
+        json_data = json.loads(decoded)
+    # Extract only the top-level "score"
+        main_score = json_data["score"]
+
+        update_data = {
+        "is_analyzed": True,
+        "ai_generated_score": main_score * 100  # Replace with your calculated score
+        }
+
+    # Perform the update
+        response = supabase.table("job_applications").update(update_data).eq("id", row['id']).execute()
+
+        if os.path.exists(pdf_name):
+            os.remove(pdf_name)
+
+        
+
+        
 
 
 
