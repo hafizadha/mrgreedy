@@ -506,25 +506,23 @@ async def get_job_application_by_resume_id(resume_id: int):
 
 
 @app.post("/send_job_application")
-async def send_job_application(selected_job: str = Form(...), file: UploadFile = File(...)):
+async def send_job_application(selected_job_id: int, file: UploadFile = File(...)):
     if file.content_type != "application/pdf":
         return JSONResponse(content={"error": "Only PDF files are allowed."}, status_code=400)
-    
-
-    selected_job = selected_job.strip()
-    print(selected_job)
 
 
-    response = supabase.table("job_role").select("*").eq("job_role", selected_job).execute()
+    response = supabase.table("job_role").select("*").eq("id", selected_job_id).execute()
 
     rows = response.data
+    print(rows)
 
     job_desc = rows[0]["job_description"]
+    job_role = rows[0]["job_role"]
 
     parsed_job_desc = model.generate_content(
     f"""
     You are a Job Description parser that will extract information about job description,
-    Job Title : {selected_job}
+    Job Title : {job_role}
     Job Description ; {job_desc}
     
     Your job is to extract the Education required, What the candidate is expected to do on the job and the education required.
@@ -664,6 +662,7 @@ async def send_job_application(selected_job: str = Form(...), file: UploadFile =
         answer_json["Level_Similarity"] = float(level_similarity)
         answer_json["Job_Desc"] = job_desc
         answer_json["ResumeID"] = new_resume_id
+        answer_json["job_role_id"] = selected_job_id
         print(3)
 
         print("-------------------")
