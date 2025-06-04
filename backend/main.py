@@ -10,10 +10,10 @@ import json
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.utils.math import cosine_similarity
 import numpy as np
-import firebase_admin
-from firebase_admin import db, credentials
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.concurrency import run_in_threadpool # For running sync code in async endpoint
 from supabase import create_client, Client
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import shutil
@@ -22,6 +22,7 @@ from google import genai as gi
 from markitdown import MarkItDown
 import requests
 from firecrawl import FirecrawlApp, JsonConfig
+from typing import List, Optional
 
 
 
@@ -40,13 +41,6 @@ model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
 app = FastAPI()
 
-cred = credentials.Certificate("credentials.json")
-firebase_admin.initialize_app(
-    cred,
-    {
-        "databaseURL": "https://hack-attack-cd723-default-rtdb.asia-southeast1.firebasedatabase.app/"
-    },
-)
 
 origins = [
     "http://localhost:3000",  # Your React Native web app development server
@@ -90,6 +84,35 @@ if not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+from pydantic import BaseModel, Field
+
+class ChatRequest(BaseModel):
+    input: str = Field(..., description="The HR user's question about the candidate.")
+    resume_id: str = Field(..., description="The ResumeID of the candidate (e.g., '0', '1', '23').")
+                                       # Assuming ResumeID is stored as string or can be cast to string.
+                                       # If it's always an int, you can use int here.
+
+class ChatResponse(BaseModel):
+    generated_response: str
+
+class JobFrontendFormat(BaseModel):
+    id: str
+    title: str # This will be job_role from your DB
+    company: Optional[str] = "N/A" # Default if not found
+    location: Optional[str] = "N/A"
+    type: Optional[str] = "N/A" # e.g., Full-time, Internship
+    experience: Optional[str] = "N/A"
+    salary: Optional[str] = "N/A"
+    description: str # A concise description extracted by the LLM
+    requirements: List[str] = []
+    benefits: List[str] = []
+
+# You might also want a model for the raw data from Supabase for type hinting
+class JobRoleDB(BaseModel):
+    id: int
+    job_role: str
+    job_description: str
+    required_skills: Optional[str] # As per your CSV
 
 
 def portfolio_scraper(portfolio_str):
@@ -106,7 +129,6 @@ def portfolio_scraper(portfolio_str):
     print(json.dumps(response.data, indent=4))
 
     # JANGAN LUPA FORMATTING
-
 
 def ai_detection():
     gemini_client =  gi.Client(api_key="EnterAPI")
@@ -152,12 +174,299 @@ def ai_detection():
         if os.path.exists(pdf_name):
             os.remove(pdf_name)
 
+async def upload_pdf_from_bytes(file_content: bytes, save_as: str = "temp_file.pdf"):
+    try:
+        with open(save_as, "wb") as buffer:
+            buffer.write(file_content)
+        return {"message": f"File saved as {save_as}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+ 
+# --- Helper Functions ---
+def find_similarity(text1:str, text2:str) -> float: # Added type hint for return
+    emb1 = embedding_model.embed_query(text1)
+    emb2 = embedding_model.embed_query(text2)
+    vec1 = np.array(emb1).reshape(1, -1)
+    vec2 = np.array(emb2).reshape(1, -1)
+    cos_sim = cosine_similarity(vec1, vec2)[0][0]
+    return float(cos_sim) # Ensure it's a float
+
+async def get_resume_full_text(resume_id_str: str) -> str:
+    """
+    Downloads a resume PDF from Supabase (named as resume_id_str.pdf) and extracts its full text.
+    """
+    pdf_filename_on_storage = f"{resume_id_str}.pdf"
+    try:
+        # print(f"Attempting to download: {pdf_filename_on_storage} from bucket: {BUCKET_NAME}")
+        pdf_bytes = await run_in_threadpool(supabase.storage.from_(BUCKET_NAME).download, pdf_filename_on_storage)
+
+        if not pdf_bytes: # Check if download returned None or empty bytes
+            raise FileNotFoundError(f"PDF {pdf_filename_on_storage} not found or empty in Supabase storage.")
+
+        pdf_stream = BytesIO(pdf_bytes)
+        full_text = await run_in_threadpool(extract_text, pdf_stream)
+        return full_text.replace("\n", " ").strip() # Normalize newlines and strip whitespace
+    except Exception as e: # Catching a broader exception from supabase download
+        print(f"Error getting full text for resume {resume_id_str}: {type(e).__name__} - {e}")
+        # Supabase download might raise different errors, not just FileNotFoundError
+        # Check message for common indicators of "not found"
+        if "The resource was not found" in str(e) or "NotFound" in str(e) or "does not exist" in str(e).lower():
+             raise HTTPException(status_code=404, detail=f"Resume PDF for ID '{resume_id_str}' not found in storage.")
+        raise HTTPException(status_code=500, detail=f"Could not extract text from resume PDF: {str(e)}")
+
+
+# --- API Endpoints ---
+
+# --- Helper for LLM Parsing of Job Description ---
+async def parse_job_description_to_structured_format(job_title: str, job_description_text: str) -> JobFrontendFormat:
+    """
+    Uses Gemini to parse a raw job description text into a structured format.
+    """
+    prompt = f"""
+You are an expert job description parser. Your task is to extract specific information from the provided job description text and format it as a JSON object.
+
+Job Title: {job_title}
+Raw Job Description Text:
+---
+{job_description_text}
+---
+
+Based *only* on the "Raw Job Description Text" provided above, extract the following information.
+If a piece of information is not explicitly mentioned, use "Not specified" for string fields or an empty list [] for list fields.
+
+Return ONLY a valid JSON object in the following exact format:
+{{
+  "company": "string (e.g., TechCorp Inc.)",
+  "location": "string (e.g., San Francisco, CA (Remote))",
+  "type": "string (e.g., Full-time, Internship, Contract)",
+  "experience": "string (e.g., 5+ years experience, Entry Level)",
+  "salary": "string (e.g., $120k - $150k, Competitive)",
+  "description": "string (A concise summary of the job role, 1-2 sentences max. If the original description is short, you can use it. Focus on the core responsibilities.)",
+  "requirements": ["string", "string", ...],
+  "benefits": ["string", "string", ...]
+}}
+
+Important Considerations:
+- For "requirements" and "benefits", list each distinct point as a separate string in the array.
+- If the description mentions "Responsibilities", "Requirements", "Qualifications", "Skills", etc., these should primarily go into the "requirements" list.
+- If the description mentions "Perks", "What we offer", "Benefits", etc., these should go into the "benefits" list.
+- Be accurate and stick to the provided text. Do not infer or add external information.
+- The "description" field should be a brief overview, not the entire job description.
+
+JSON Output:
+    """
+
+    try:
+        # print(f"--- Sending to Gemini for JD Parsing ({job_title}) ---")
+        # print(prompt)
+        # print("-----------------------------------------------------")
+        response = await run_in_threadpool(model.generate_content, prompt)
+
+        if response.candidates and response.candidates[0].content.parts:
+            raw_json_text = response.candidates[0].content.parts[0].text.strip()
+            # print(f"--- Raw JSON from Gemini ({job_title}) ---")
+            # print(raw_json_text)
+            # print("-------------------------------------------")
+
+            # Clean up potential markdown code block
+            cleaned_json_text = re.sub(r"^```json\s*", "", raw_json_text, flags=re.MULTILINE)
+            cleaned_json_text = re.sub(r"\s*```$", "", cleaned_json_text, flags=re.MULTILINE).strip()
+
+            parsed_data = json.loads(cleaned_json_text)
+
+            # Validate and construct the JobFrontendFormat object
+            # Provide defaults directly in the model, but can also do here
+            return JobFrontendFormat(
+                id="temp", # Will be replaced by DB ID
+                title=job_title,
+                company=parsed_data.get("company", "Not specified"),
+                location=parsed_data.get("location", "Not specified"),
+                type=parsed_data.get("type", "Not specified"),
+                experience=parsed_data.get("experience", "Not specified"),
+                salary=parsed_data.get("salary", "Not specified"),
+                description=parsed_data.get("description", "No specific summary provided."),
+                requirements=parsed_data.get("requirements", []),
+                benefits=parsed_data.get("benefits", [])
+            )
+        else:
+            error_reason = "No response from LLM"
+            if response.prompt_feedback:
+                error_reason = f"LLM prompt feedback: {response.prompt_feedback}"
+            print(f"Could not parse job description for '{job_title}': {error_reason}")
+            # Return a default structure indicating failure for this specific job
+            return JobFrontendFormat(id="temp", title=job_title, description=f"Could not parse job details: {error_reason}")
+
+    except json.JSONDecodeError as e:
+        print(f"JSONDecodeError for '{job_title}': {e}. Raw text: '{cleaned_json_text if 'cleaned_json_text' in locals() else raw_json_text if 'raw_json_text' in locals() else 'N/A'}'")
+        return JobFrontendFormat(id="temp", title=job_title, description=f"Error parsing LLM response (JSON format issue).")
+    except Exception as e:
+        print(f"Exception parsing job description for '{job_title}': {type(e).__name__} - {e}")
+        return JobFrontendFormat(id="temp", title=job_title, description=f"An unexpected error occurred during parsing: {str(e)}")
+
+
+@app.get("/api/structured-job-roles", response_model=List[JobFrontendFormat])
+async def get_structured_job_roles():
+    """
+    Fetches all job roles from the database, parses their descriptions using an LLM,
+    and returns them in a structured format suitable for the frontend.
+    """
+    formatted_jobs: List[JobFrontendFormat] = []
+    try:
+        db_response = await run_in_threadpool(
+            supabase.table("job_role").select("id, job_role, job_description").execute
+        )
+
+        if not db_response.data:
+            return [] # No jobs found
+
+        for job_from_db in db_response.data:
+            db_id_str = str(job_from_db.get("id"))
+            job_title = job_from_db.get("job_role", "Untitled Job")
+            raw_description = job_from_db.get("job_description", "")
+
+            if not raw_description:
+                # Handle cases with no description
+                formatted_job = JobFrontendFormat(
+                    id=db_id_str,
+                    title=job_title,
+                    description="No job description provided."
+                )
+                formatted_jobs.append(formatted_job)
+                continue
+
+            # Parse the raw description
+            parsed_job_details = await parse_job_description_to_structured_format(job_title, raw_description)
+
+            # Update the id and title from the database record, as parsing focuses on other fields
+            parsed_job_details.id = db_id_str
+            parsed_job_details.title = job_title # Ensure DB title is used
+
+            formatted_jobs.append(parsed_job_details)
+
+        return formatted_jobs
+
+    except Exception as e:
+        print(f"Error in /api/structured-job-roles: {type(e).__name__} - {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch or process job roles.")
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def resume_chat(request: ChatRequest):
+    """
+    Handles chat interaction with an AI assistant about a specific resume.
+    """
+    try:
+        try:
+            # ResumeID is an integer in the database, but comes as string from request
+            resume_id_int = int(request.resume_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid ResumeID format. Must be a number: '{request.resume_id}'")
+
+        # 1. Fetch application data from Supabase based on ResumeID (integer)
+        db_response = await run_in_threadpool(
+            supabase.table("job_applications")
+            .select("*")
+            .eq("id", resume_id_int)
+            .maybe_single() # Expects 0 or 1 row
+            .execute
+        )
+
+        if not db_response.data:
+            raise HTTPException(status_code=404, detail=f"Candidate data for ResumeID '{request.resume_id}' not found.")
+
+        candidate_data = db_response.data # This is a dictionary for the single row
+
+        # 2. Get full resume text (using the original string resume_id for filename)
+        # full_resume_text = await get_resume_full_text(request.resume_id)
+        # if not full_resume_text: # Add a check here just in case
+        #     full_resume_text = "Resume text could not be extracted."
         
 
+
+        # 3. Prepare data for the prompt
+        # Composite Match Score (Average of available similarities)
+        similarity_scores = [
+            candidate_data.get("Experience_Similarity"),
+            candidate_data.get("Education_Similarity"),
+            candidate_data.get("Skill_Similarity"),
+            candidate_data.get("Level_Similarity")
+        ]
+        valid_scores = [s for s in similarity_scores if isinstance(s, (int, float))] # Filter out None or non-numeric
+        overall_match_score_val = (sum(valid_scores) / len(valid_scores) * 100) if valid_scores else 0.0
+        overall_match_score_str = f"{overall_match_score_val:.2f}"
+
+        # AI Generated Content Percentage
+        ai_score_val = candidate_data.get("ai_generated_score")
+        if isinstance(ai_score_val, (int, float)):
+            ai_generated_percentage_str = f"{ai_score_val:.2f}" # Using the direct value
+        elif candidate_data.get("is_analyzed") == False:
+            ai_generated_percentage_str = "Not yet analyzed"
+        else:
+            ai_generated_percentage_str = "N/A"
+
+
+        # Spam Score (not in CSV, so explicitly state as N/A)
+        spam_score_str = "N/A (not available in current analysis)"
+
+        # Extracted Skills
+        extracted_skills_str = candidate_data.get("Skills", "Not specified in the analysis")
+        if not extracted_skills_str: extracted_skills_str = "Not specified in the analysis"
+
+
+        # 4. Construct the prompt for Gemini
+        #    Ensure all placeholders are filled with string values
+        prompt_template = f"""
+You are an expert HR Resume Analysis Assistant.
+Your primary function is to answer questions about a specific candidate's resume and its analysis, based *solely* on the information provided to you below.
+Do not make assumptions, invent information, or use any external knowledge beyond what is given here.
+If the answer cannot be found in the provided information, clearly state that the information is not available in the resume or analysis provided.
+Be concise and professional in your responses.
+
+Candidate Information (ID: {request.resume_id}):
+---
+Full Resume Text:
+{candidate_data}
+---
+Analysis Scores:
+- Composite Match Score (average of similarities): {overall_match_score_str}%
+- AI Generated Content Percentage: {ai_generated_percentage_str}%
+- Spam Score: {spam_score_str}
+---
+Extracted Skills:
+{extracted_skills_str}
+---
+
+HR User's Question:
+"{request.input}"
+
+Based on the information provided above, please answer the HR User's question.
+
+Your Answer:
+"""
+        # print("---- PROMPT FOR GEMINI ----")
+        # print(prompt_template)
+        # print("--------------------------")
+
+        # 5. Send prompt to Gemini API
+        gemini_response = await run_in_threadpool(model.generate_content, prompt_template)
+
+        generated_text = "I am unable to provide a response based on the information." # Default
+        if gemini_response.candidates and gemini_response.candidates[0].content.parts:
+            generated_text = gemini_response.candidates[0].content.parts[0].text.strip()
+        elif gemini_response.prompt_feedback:
+            generated_text += f" (Reason: {gemini_response.prompt_feedback})"
         
+        if not generated_text.strip(): # If Gemini returns an empty string
+             generated_text = "The model generated an empty response. Please try rephrasing your question or check the provided candidate data."
 
 
+        return ChatResponse(generated_response=generated_text)
 
+    except HTTPException as e:
+        raise e # Re-raise HTTPExceptions to let FastAPI handle them
+    except Exception as e:
+        print(f"Error in /api/chat: {type(e).__name__} - {e}")
+        # Consider logging `e` with `traceback.format_exc()` for full stack trace
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while processing your chat request: {str(e)}")
 
 @app.get("/get_available_jobs")
 async def get_available_jobs():
@@ -165,6 +474,35 @@ async def get_available_jobs():
     table_ref = supabase.table(table_name)
     response = table_ref.select("*").execute()
     return response.data
+
+@app.get("/get_all_job_applications")
+async def get_all_job_applications():
+    table_name = "job_applications" # Name of your table
+    try:
+        response = supabase.table(table_name).select("*").execute()
+        if response.data:
+            return response.data
+        else:
+            return []
+    except Exception as e:
+        print(f"Error fetching from {table_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching job applications: {str(e)}")
+    
+@app.get("/get_job_application/{resume_id}")
+async def get_job_application_by_resume_id(resume_id: int):
+    table_name = "job_applications"
+    try:
+        # .eq() stands for "equals"
+        response = supabase.table(table_name).select("*").eq("id", resume_id).execute()
+        if response.data:
+            return response.data[0] # Assuming ResumeID is unique, returns the first match
+        else:
+            raise HTTPException(status_code=404, detail=f"Application with ResumeID {resume_id} not found")
+    except HTTPException:
+        raise # Re-raise HTTPException
+    except Exception as e:
+        print(f"Error fetching application {resume_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/send_job_application")
@@ -388,16 +726,6 @@ async def send_job_application(selected_job: str = Form(...), file: UploadFile =
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-async def upload_pdf_from_bytes(file_content: bytes, save_as: str = "temp_file.pdf"):
-    try:
-        with open(save_as, "wb") as buffer:
-            buffer.write(file_content)
-        return {"message": f"File saved as {save_as}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-
-
 @app.get("/get_resume_pdf")
 def download_pdf(pdf_filename: str = Query(..., description="The name of the PDF in Supabase")):
     try:
@@ -408,8 +736,10 @@ def download_pdf(pdf_filename: str = Query(..., description="The name of the PDF
         with open(pdf_filename, "wb") as f:
             f.write(response)
 
-        return {"message": f"{pdf_filename} downloaded and saved locally."}
-    except Exception as e:
+        # return {"message": f"{pdf_filename} downloaded and saved locally."}
+        # Return the file to the client
+        return FileResponse(path=pdf_filename, filename=pdf_filename, media_type='application/pdf')
+    except Exception as e:  
         raise HTTPException(status_code=500, detail=str(e))
 
     
