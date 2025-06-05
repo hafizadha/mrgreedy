@@ -116,19 +116,16 @@ class JobRoleDB(BaseModel):
 
 
 def portfolio_scraper(portfolio_str):
-    portfolio_str = "https://coedd-territory.vercel.app/"
-
     FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
     app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
 
-    response = app.extract([
-    portfolio_str
-    ], prompt='Extract the applicants name and email, their projects, experiences and top skills. For projects and experiences, include their name and description. Then for skills in project and experience, include into top skills')
-    print(response)
-
-    print(json.dumps(response.data, indent=4))
-
-    # JANGAN LUPA FORMATTING
+    try :
+        response = app.extract([
+        portfolio_str
+        ], prompt='Extract the applicants name and email, their projects, experiences and top skills. For projects and experiences, include their name and description. Then for skills in project and experience, include into top skills')
+        return json.dumps(response.data, indent=4)
+    except :
+        return "error"
 
 def ai_detection():
     gemini_client =  gi.Client(api_key="EnterAPI")
@@ -370,11 +367,19 @@ async def resume_chat(request: ChatRequest):
             .execute
         )
 
+        
+
+
         if not db_response.data:
             raise HTTPException(status_code=404, detail=f"Candidate data for ResumeID '{request.resume_id}' not found.")
 
         candidate_data = db_response.data # This is a dictionary for the single row
 
+
+        portfolio_info = "None"
+        if("folio" in request.input):
+            portfolio_info = portfolio_scraper(candidate_data["Portfolio_link"])
+            print(portfolio_info)
         # 2. Get full resume text (using the original string resume_id for filename)
         # full_resume_text = await get_resume_full_text(request.resume_id)
         # if not full_resume_text: # Add a check here just in case
@@ -484,6 +489,9 @@ Candidate Information (ID: {request.resume_id}):
 Full Resume Text:
 {resume_text_for_prompt}
 ---
+Portfolio Information:
+{portfolio_info}
+---
 Analysis Scores:
 - Composite Match Score (average of similarities): {overall_match_score_str}%
 - AI Generated Content Percentage: {ai_generated_percentage_str}%
@@ -529,6 +537,7 @@ Your Answer:
         print(f"Error in /api/chat: {type(e).__name__} - {e}")
         # Consider logging `e` with `traceback.format_exc()` for full stack trace
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred while processing your chat request: {str(e)}")
+
 
 @app.get("/get_available_jobs")
 async def get_available_jobs():
@@ -831,6 +840,183 @@ def download_pdf(resume_ID: int):
         print(f"Error fetching application {resume_ID}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    
 
+class MatchScoreDistributionItem(BaseModel):
+    range: str  # e.g., "0-20%", "81-100%"
+    count: int
+
+class EducationBreakdownItem(BaseModel):
+    category: str # e.g., "Computer Science", "Engineering", "Other"
+    count: int
+
+class ApplicationsOverTimeItem(BaseModel):
+    date: str  # e.g., "YYYY-MM-DD"
+    count: int
+
+class TopApplicantItem(BaseModel):
+    id: int
+    name: str
+    match_score: float # As a percentage
+
+class DashboardDataResponse(BaseModel):
+    total_applicants: int
+    average_match_score: float # As a percentage
+    potential_spam_count: int
+    match_score_distribution: List[MatchScoreDistributionItem]
+    education_breakdown: List[EducationBreakdownItem]
+    applications_over_time: List[ApplicationsOverTimeItem] # This will be tricky without timestamps
+    top_10_applicants: List[TopApplicantItem]
+
+# --- Education Classification Logic ---
+
+# Predefined keywords for education categories. More sophisticated NLP could be used.
+EDUCATION_CATEGORIES = {
+    "Computer Science": ["computer science", "informatics", "software engineering", "artificial intelligence", "data science", "information system"],
+    "Engineering": ["engineering", "electrical", "network", "telecommunications", "mechanical", "civil"], # Add more engineering fields
+    "Business": ["business", "management", "mba", "marketing", "finance", "accounting"],
+    "Mathematics & Statistics": ["mathematics", "statistics", "actuarial"],
+    # Add more categories as needed
+}
+
+def classify_education(education_text: str) -> str:
+    if not education_text or not isinstance(education_text, str):
+        return "Other / Not Specified"
     
+    education_text_lower = education_text.lower()
+    for category, keywords in EDUCATION_CATEGORIES.items():
+        if any(keyword in education_text_lower for keyword in keywords):
+            return category
+    return "Other / Not Specified"
+
+# --- New Dashboard Endpoint ---
+
+@app.get("/api/dashboard_data/{job_role_id}", response_model=DashboardDataResponse)
+async def get_dashboard_data(job_role_id: int):
+    try:
+        # Fetch relevant job applications for the given job_role_id
+        # Using your existing logic but ensuring it's efficient
+        response = await run_in_threadpool(
+            supabase.table("job_applications")
+            .select("id, Name, Education, Education_Similarity, Experience_Similarity, Skill_Similarity, Level_Similarity, spam_probability, created_at") # Select only needed fields + created_at
+            .eq("job_role_id", job_role_id)
+            .execute
+        )
+
+        if not response.data:
+            # Return empty/default dashboard data if no applications
+            return DashboardDataResponse(
+                total_applicants=0,
+                average_match_score=0.0,
+                potential_spam_count=0,
+                match_score_distribution=[],
+                education_breakdown=[],
+                applications_over_time=[],
+                top_10_applicants=[]
+            )
+
+        applications_df = pd.DataFrame(response.data)
+
+        # --- Calculate Basic Stats ---
+        total_applicants = len(applications_df)
+        
+        # Calculate individual match scores (average of similarities, scaled to 0-100)
+        def calculate_match_score(row):
+            sim_scores = [
+                row.get("Education_Similarity", 0), 
+                row.get("Experience_Similarity", 0),
+                row.get("Skill_Similarity", 0),
+                row.get("Level_Similarity", 0)
+            ]
+            valid_sim_scores = [s for s in sim_scores if isinstance(s, (int, float)) and s is not None]
+            if not valid_sim_scores:
+                return 0.0
+            return (sum(valid_sim_scores) / len(valid_sim_scores)) * 100
+        
+        applications_df["match_score"] = applications_df.apply(calculate_match_score, axis=1)
+        
+        average_match_score = applications_df["match_score"].mean() if total_applicants > 0 else 0.0
+        
+        # Convert spam_probability (0-1) to spam_score (0-100)
+        applications_df["spam_score"] = applications_df["spam_probability"].fillna(0).apply(lambda x: x * 100)
+        potential_spam_count = int(applications_df[applications_df["spam_score"] > 70].shape[0])
+
+
+        # --- 1. Match Score Distribution ---
+        bins = [0, 20, 40, 60, 80, 101]  # Bins up to 101 to include 100
+        labels = ["0-20%", "21-40%", "41-60%", "61-80%", "81-100%"]
+        applications_df["match_score_range"] = pd.cut(applications_df["match_score"], bins=bins, labels=labels, right=False) # right=False means [0, 20), [20, 40) ...
+        
+        distribution_counts = applications_df["match_score_range"].value_counts().sort_index()
+        match_score_distribution_data = [
+            MatchScoreDistributionItem(range=str(idx), count=int(val)) for idx, val in distribution_counts.items()
+        ]
+        # Ensure all labels are present, even if count is 0
+        all_ranges_distribution = []
+        for label in labels:
+            item = next((d for d in match_score_distribution_data if d.range == label), None)
+            if item:
+                all_ranges_distribution.append(item)
+            else:
+                all_ranges_distribution.append(MatchScoreDistributionItem(range=label, count=0))
+        match_score_distribution_data = all_ranges_distribution
+
+
+        # --- 2. Education Breakdown ---
+        applications_df["education_category"] = applications_df["Education"].apply(classify_education)
+        education_counts = applications_df["education_category"].value_counts()
+        education_breakdown_data = [
+            EducationBreakdownItem(category=str(idx), count=int(val)) for idx, val in education_counts.items()
+        ]
+
+        # --- 3. Number of Applications Over Time ---
+        # IMPORTANT: This requires a 'created_at' (or similar timestamp) column in your 'job_applications' table.
+        # If you don't have it, this part will not work accurately.
+        applications_over_time_data: List[ApplicationsOverTimeItem] = []
+        if "created_at" in applications_df.columns and not applications_df["created_at"].isnull().all():
+            try:
+                applications_df["created_at_dt"] = pd.to_datetime(applications_df["created_at"])
+                # Example: Group by day for the last 30 days
+                # You might want more sophisticated grouping (week, month) or date range
+                time_counts = applications_df.groupby(applications_df["created_at_dt"].dt.date)['id'].count()
+                
+                # If you want to ensure a continuous range of dates even with 0 applications:
+                # date_range = pd.date_range(end=datetime.now().date(), periods=30, freq='D').date
+                # time_counts = time_counts.reindex(date_range, fill_value=0)
+
+                applications_over_time_data = [
+                    ApplicationsOverTimeItem(date=str(date_val), count=int(count_val))
+                    for date_val, count_val in time_counts.items()
+                ]
+                applications_over_time_data.sort(key=lambda x: x.date) # Ensure chronological order
+            except Exception as e_time:
+                print(f"Error processing 'created_at' for applications over time: {e_time}")
+                # Fallback to empty or error indicator if processing fails
+        else:
+            print("Warning: 'created_at' column missing or all null. Cannot generate applications over time data.")
+
+
+        # --- 4. Top 10 Applicants (by Match Score) ---
+        top_10_df = applications_df.sort_values(by="match_score", ascending=False).head(10)
+        top_10_applicants_data = [
+            TopApplicantItem(
+                id=int(row["id"]), 
+                name=str(row["Name"]), 
+                match_score=float(row["match_score"])
+            ) for _, row in top_10_df.iterrows()
+        ]
+
+        return DashboardDataResponse(
+            total_applicants=total_applicants,
+            average_match_score=round(average_match_score, 2),
+            potential_spam_count=potential_spam_count,
+            match_score_distribution=match_score_distribution_data,
+            education_breakdown=education_breakdown_data,
+            applications_over_time=applications_over_time_data,
+            top_10_applicants=top_10_applicants_data,
+        )
+
+    except Exception as e:
+        import traceback
+        print(f"Error generating dashboard data for job_role_id {job_role_id}: {type(e).__name__} - {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to generate dashboard data: {str(e)}")
