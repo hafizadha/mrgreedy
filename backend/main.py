@@ -379,8 +379,64 @@ async def resume_chat(request: ChatRequest):
         # full_resume_text = await get_resume_full_text(request.resume_id)
         # if not full_resume_text: # Add a check here just in case
         #     full_resume_text = "Resume text could not be extracted."
-        
 
+        # 2. Get full resume text
+        resume_text_for_prompt: str
+
+        # --- Construct filename for Supabase Storage based on SCENARIO A ---
+        # ResumeID column in the database stores a base identifier (e.g., 7, 123).
+        # Files in storage are named like "7.pdf", "123.pdf".
+        if "ResumeID" not in candidate_data or candidate_data["ResumeID"] is None:
+            raise HTTPException(status_code=500, detail=f"ResumeID field is missing or null for candidate {resume_id_int}. Cannot locate PDF.")
+
+        # Ensure ResumeID is treated as a string for filename construction
+        base_resume_id_for_filename = str(candidate_data["ResumeID"])
+        resume_filename_in_storage = base_resume_id_for_filename + ".pdf"
+        # --- End Scenario A filename construction ---
+
+        print(f"DEBUG: Value of candidate_data['ResumeID'] (used for filename base): {base_resume_id_for_filename}")
+        print(f"DEBUG: Attempting to download '{resume_filename_in_storage}' from bucket '{BUCKET_NAME}'")
+
+        # resume_record = db_response.data
+        # resume_filename = str(resume_record["ResumeID"]) + ".pdf"
+        #     # Download the file from Supabase
+        # file_bytes  = supabase.storage.from_(BUCKET_NAME).download(resume_filename)
+        
+        # pdf_stream = BytesIO(file_bytes)
+
+        # # Extract text using pdfminer.six
+        # text = extract_text(pdf_stream)
+
+        # text = text.replace("\n"," ")
+
+        # print(text)
+
+        try:
+            # Run the synchronous Supabase download method in a thread pool
+            file_bytes = await run_in_threadpool(
+                supabase.storage.from_(BUCKET_NAME).download,
+                resume_filename_in_storage
+            )
+
+            if file_bytes is None: # Should not happen if download raises error, but good check
+                raise ValueError("Supabase storage download returned None, expected bytes or error.")
+
+            pdf_stream = BytesIO(file_bytes)
+            extracted_pdf_text = extract_text(pdf_stream) # pdfminer.six function
+            resume_text_for_prompt = extracted_pdf_text.replace("\n", " ").strip()
+
+            if not resume_text_for_prompt:
+                resume_text_for_prompt = "Resume text was extracted but appears to be empty."
+            # print(f"DEBUG: Extracted PDF text (first 500 chars): {resume_text_for_prompt[:500]}...")
+
+        except Exception as e_storage: # Catch potential errors from storage download or PDF extraction
+            # This will catch Supabase APIError (e.g., 404 Object Not Found) or pdfminer errors
+            print(f"Error downloading or parsing PDF '{resume_filename_in_storage}': {type(e_storage).__name__} - {e_storage}")
+            resume_text_for_prompt = (
+                f"Full resume text could not be retrieved or parsed. "
+                f"(File sought: '{resume_filename_in_storage}'. Error: {type(e_storage).__name__}). "
+                f"Please ask about the analyzed scores and skills available from the database."
+            )
 
         # 3. Prepare data for the prompt
         # Composite Match Score (Average of available similarities)
@@ -411,6 +467,8 @@ async def resume_chat(request: ChatRequest):
         extracted_skills_str = candidate_data.get("Skills", "Not specified in the analysis")
         if not extracted_skills_str: extracted_skills_str = "Not specified in the analysis"
 
+        job_role_description = candidate_data.get("Job_Desc", "Not specified in the analysis")
+
 
         # 4. Construct the prompt for Gemini
         #    Ensure all placeholders are filled with string values
@@ -424,7 +482,7 @@ Be concise and professional in your responses.
 Candidate Information (ID: {request.resume_id}):
 ---
 Full Resume Text:
-{candidate_data}
+{resume_text_for_prompt}
 ---
 Analysis Scores:
 - Composite Match Score (average of similarities): {overall_match_score_str}%
@@ -433,6 +491,10 @@ Analysis Scores:
 ---
 Extracted Skills:
 {extracted_skills_str}
+---
+
+Job Role Information:
+{job_role_description}
 ---
 
 HR User's Question:
@@ -502,6 +564,23 @@ async def get_job_application_by_resume_id(resume_id: int):
         raise # Re-raise HTTPException
     except Exception as e:
         print(f"Error fetching application {resume_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/get_job_application_by_role/{job_role_id}")
+async def get_job_application_by_job_role_id(job_role_id: int):
+    table_name = "job_applications"
+    try:
+        table_name = "job_applications"
+        table_ref = supabase.table(table_name)
+        response = table_ref.select("*").execute()
+        df = pd.DataFrame(response.data)
+        df = df[df["job_role_id"]==job_role_id]
+        df.drop(columns=["Job_Desc"],inplace=True)
+        df.fillna(-1,inplace=True)
+        return JSONResponse(content=df.to_dict(orient="records"))
+    except Exception as e:
+        print(f"Error fetching job applicants for {job_role_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -726,19 +805,30 @@ async def send_job_application(selected_job_id: int, file: UploadFile = File(...
 
 
 @app.get("/get_resume_pdf")
-def download_pdf(pdf_filename: str = Query(..., description="The name of the PDF in Supabase")):
+def download_pdf(resume_ID: int):
+    table_name = "job_applications"
     try:
-        # Download the file from Supabase
-        response = supabase.storage.from_(BUCKET_NAME).download(pdf_filename)
+        # .eq() stands for "equals"
+        response = supabase.table(table_name).select("ResumeID").eq("id", resume_ID).execute()
+        
+        if response.data:
+            resume_record = response.data[0]
+            resume_filename = str(resume_record["ResumeID"]) + ".pdf"
+            # Download the file from Supabase
+            file_bytes  = supabase.storage.from_(BUCKET_NAME).download(resume_filename)
 
-        # Save it using the original filename
-        with open(pdf_filename, "wb") as f:
-            f.write(response)
+            # Save it using the original filename
+            with open(resume_filename, "wb") as f:
+                f.write(file_bytes)
 
-        # return {"message": f"{pdf_filename} downloaded and saved locally."}
-        # Return the file to the client
-        return FileResponse(path=pdf_filename, filename=pdf_filename, media_type='application/pdf')
-    except Exception as e:  
+            # Return the file to the client
+            return FileResponse(path=resume_filename, filename=resume_filename, media_type='application/pdf')
+        else:
+            raise HTTPException(status_code=404, detail=f"Application with ResumeID {resume_ID} not found")
+    except HTTPException:
+        raise # Re-raise HTTPException
+    except Exception as e:
+        print(f"Error fetching application {resume_ID}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     
