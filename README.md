@@ -84,10 +84,10 @@ Our platform automates tedious recruitment tasks, enabling HR teams to focus on 
 - **Backend**: FastAPI (Python)  
 - **Database**: Supabase  
 - **AI Services**:
-  - Google Gemini: Resume parsing, Chatbot
-  - Hugging Face: Sentence similarity models
-  - Sapling: AI-generated/fake text detection
-  - Firecrawl: Portfolio scraping and analysis
+  - Google Gemini
+  - Hugging Face
+  - Sapling
+  - Firecrawl
 
 ---
 
