@@ -34,7 +34,18 @@ Our platform automates tedious recruitment tasks, enabling HR teams to focus on 
 
 ---
 
-## 🚀 Key Features
+## 🚀 Key Features (Applicant Side)
+
+### 1. Centralized Application Form
+![image](https://github.com/user-attachments/assets/2f3fdf49-247f-48f4-89a9-5470e54c5f04)
+
+- When a candidate submits their resume, our backend endpoint instantly processes the application in a single, synchronous operation. The system parses the resume, analyzes portfolio links, checks for spam, and calculates a final ranking score using sentence similarity.
+
+- Once the analysis is complete, both the original resume file and the fully structured results are saved to our Supabase database. This ensures that a complete, ranked, and fully vetted candidate profile appears on the recruiter's dashboard immediately, ready for review.
+
+---
+
+## 🚀 Key Features (HR Side)
 
 ### 1. AI-Driven Application Filtering
 
