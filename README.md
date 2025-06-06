@@ -118,8 +118,12 @@ Our **key differentiators** are advanced spam detection and portfolio analysisâ€
 
 Have any issue or inquiry? Contact
 
-- Email: afzal.ariffin04@gmail.com 
-- License: MIT
+- Email:
+  - afzal.ariffin04@gmail.com
+  - muhdizzhanhakimi@gmail.com
+  - hafizadhaazahari@gmail.com
+  - ahmadimanh3@gmail.com
+
 
 ---
 
