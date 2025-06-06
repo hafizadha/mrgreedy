@@ -76,51 +76,6 @@ Our platform automates tedious recruitment tasks, enabling HR teams to focus on 
 
 ---
 
-## 🛠️ How It Works
-
-### Resume Scoring Logic
-
-![image](https://github.com/user-attachments/assets/4c8a0861-a4da-4fbd-a91d-db8163d2f19e)
-
-
-```text
-Final_Resume_Score = (Skill_Similarity + Experience_Similarity) / 2
-```
-
-- `Skill_Similarity`: Measures alignment between job-required and resume-listed skills.
-- `Experience_Similarity`: Compares job role descriptions with candidate experience using NLP.
-- Models used: Sentence-BERT and custom transformers from Hugging Face.
-
-
----
-
-### 🔄 System Workflow
-
-1. **Application Submission**  
-   → User uploads resume, portfolio, and job preferences.
-
-2. **Resume Parsing**  
-   → Google Gemini extracts structured data.
-
-3. **Spam & Fake Detection**  
-   → Sapling AI filters low-quality or fake submissions.
-
-4. **Resume Scoring**  
-   → Semantic similarity models compute candidate relevance.
-
-5. **Portfolio Analysis**  
-   → Firecrawl fetches and analyzes external project links.
-
-6. **Candidate Ranking & Dashboard Updates**  
-   → Top applicants are ranked and insights visualized.
-
-7. **Recruiter Interaction**  
-   → AI Chatbot available for deep dives on any profile.
-
-![image](https://github.com/user-attachments/assets/dd4530e1-ba95-4061-9ff7-87f231278bb6)
-
----
-
 ## 🧱 Technical Architecture
 
 ![image](https://github.com/user-attachments/assets/864036b4-787c-4d8f-8980-b85d57b7a158)
